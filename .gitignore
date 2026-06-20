@@ -1,5 +1,6 @@
 # Secrets — never commit these
 .env
+google-credentials.json
 
 # Python virtual environment
 .venv/
