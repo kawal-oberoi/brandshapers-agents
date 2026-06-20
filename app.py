@@ -54,10 +54,14 @@ SYSTEM_PROMPT = (
     "campaign as discontinued, or changing the ideal customer profile. Keep "
     "replies short and businesslike.\n\n"
     "CRITICAL — HOW YOU KNOW THINGS:\n"
-    "You have NO memory of your own. You do not remember anything between "
-    "messages — every message starts from a blank slate. A Google Sheet is "
-    "your ONE AND ONLY source of truth, and the tools below are the ONLY way "
-    "to read or change it.\n\n"
+    "You may be shown the last few messages of the current Slack conversation "
+    "for immediate context — use them ONLY to follow a multi-turn exchange "
+    "(e.g. to interpret a short follow-up answer to a question you just asked). "
+    "You have NO durable memory of actual operational state: a Google Sheet is "
+    "your ONE AND ONLY source of truth for what is active, paused, "
+    "discontinued, or recorded, and the tools below are the ONLY way to read or "
+    "change it. Never rely on the conversation for current state — always "
+    "confirm it via read_state.\n\n"
     "  - read_state: returns the current contents of both the Segments and "
     "Briefs tabs.\n"
     "  - update_segment: add or update a target vertical/segment in the "
@@ -75,12 +79,20 @@ SYSTEM_PROMPT = (
     "3. To record any change, you MUST call the correct write tool "
     "(update_segment for segments, add_or_update_brief for briefs), then "
     "confirm exactly what you recorded — e.g. 'Recorded: mobile gaming paused "
-    "— both pipelines.'\n\n"
+    "— both pipelines.'\n"
+    "4. ACT, DON'T OVER-ASK. When an instruction to pause, activate, add, "
+    "discontinue, or change something is clear and names the pipeline (or "
+    "clearly applies to 'both'), record it RIGHT AWAY with the correct write "
+    "tool and confirm — do NOT ask for confirmation or an effective date. "
+    "Changes take effect immediately when recorded; only note a future date if "
+    "the user volunteers one. Ask a SINGLE clarifying question only when "
+    "essential information is genuinely missing — for example, the pipeline was "
+    "not given and cannot be inferred. 'Pause mobile gaming, both pipelines' is "
+    "complete: call update_segment immediately, then confirm.\n\n"
     "Pipelines are 'advertiser', 'publisher', or 'both'. When you restate "
     "intent, give a short structured summary (what changed, which pipeline, key "
-    "details). Ask one concise clarifying question only if something essential "
-    "is missing — but never let a missing detail stop you from calling "
-    "read_state for a state question."
+    "details). Never let a missing detail stop you from calling read_state for "
+    "a state question."
 )
 
 # Read the Slack + Anthropic secrets and the Sheet ID. We fail fast with a clear
@@ -360,15 +372,16 @@ def _run_tool(name: str, tool_input: dict) -> str:
 MAX_TOOL_ROUNDS = 6
 
 
-def ask_claude(user_text: str) -> str:
+def ask_claude(messages: list) -> str:
     """
-    Get a reply from Claude. Claude may call our sheet tools one or more times;
-    we run each tool, feed the result back, and repeat until Claude gives a
-    final text answer. Falls back to the latest model if the model string is
-    rejected.
+    Get a reply from Claude. `messages` is the conversation so far (recent prior
+    turns plus the current message, built by _build_conversation). Claude may
+    call our sheet tools one or more times; we run each tool, feed the result
+    back, and repeat until Claude gives a final text answer. Falls back to the
+    latest model if the model string is rejected.
     """
     global active_model
-    messages = [{"role": "user", "content": user_text}]
+    messages = list(messages)  # copy: we append tool turns below
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
@@ -427,6 +440,84 @@ def ask_claude(user_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# How many recent messages to pull from the channel/thread for short-term memory
+# of multi-turn exchanges. The Google Sheet stays the source of truth for actual
+# state — this is only enough context for follow-up answers to connect.
+HISTORY_LIMIT = 12
+
+
+def _slack_history(event) -> list:
+    """
+    Fetch the recent conversation around this message so multi-turn exchanges
+    connect. If the message is inside a thread we read that thread; otherwise we
+    read the channel's recent messages. Returns Slack message dicts in
+    chronological (oldest-first) order. On any failure we return an empty list,
+    so the bot still answers using just the current message.
+    """
+    channel = event.get("channel")
+    thread_ts = event.get("thread_ts")
+    try:
+        if thread_ts:
+            resp = app.client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=HISTORY_LIMIT
+            )
+        else:
+            resp = app.client.conversations_history(
+                channel=channel, limit=HISTORY_LIMIT
+            )
+        messages = resp.get("messages", []) or []
+    except Exception:
+        log.exception("Could not fetch Slack history; answering without it.")
+        return []
+    # conversations.history returns newest-first; replies returns oldest-first.
+    # Sort by timestamp so we always feed Claude the turns in chronological order.
+    messages.sort(key=lambda m: m.get("ts", "0"))
+    return messages
+
+
+def _build_conversation(event, user_text: str) -> list:
+    """
+    Turn the recent Slack messages into Claude-style prior turns, then append the
+    current message as the final user turn.
+
+      * The bot's own past messages become 'assistant' turns, so a follow-up like
+        'effective immediately' connects to the bot's own clarifying question.
+      * Everyone else's messages become 'user' turns.
+      * The current message (matched by ts) is excluded from the history scan and
+        re-added last, so it is always present and always last.
+      * Consecutive same-role turns are merged, and any leading assistant turns
+        are dropped (the API requires the conversation to start with the user).
+    """
+    current_ts = event.get("ts")
+    turns = []
+    for msg in _slack_history(event):
+        if msg.get("ts") == current_ts:
+            continue  # the current message is appended explicitly below
+        if msg.get("subtype"):
+            continue  # channel joins, edits, and other non-message events
+        text = strip_bot_mention(msg.get("text", "")).strip()
+        if not text:
+            continue
+        is_bot = bool(msg.get("bot_id")) or msg.get("user") == BOT_USER_ID
+        role = "assistant" if is_bot else "user"
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"] += "\n" + text
+        else:
+            turns.append({"role": role, "content": text})
+
+    # Claude requires the conversation to start with a user turn.
+    while turns and turns[0]["role"] == "assistant":
+        turns.pop(0)
+
+    # Append the current message as the final user turn (merge if the previous
+    # turn was also the user, so roles stay clean).
+    if turns and turns[-1]["role"] == "user":
+        turns[-1]["content"] += "\n" + user_text
+    else:
+        turns.append({"role": "user", "content": user_text})
+    return turns
+
+
 def _reply_with_claude(user_text, event, say, logger):
     """Shared logic: send text to Claude and post the reply in a thread."""
     user_text = user_text.strip()
@@ -437,8 +528,11 @@ def _reply_with_claude(user_text, event, say, logger):
     # thread; otherwise start a thread on the original message.
     thread_ts = event.get("thread_ts") or event["ts"]
 
+    # Include recent conversation as prior turns so follow-up answers connect.
+    messages = _build_conversation(event, user_text)
+
     try:
-        reply = ask_claude(user_text)
+        reply = ask_claude(messages)
     except Exception:
         logger.exception("Failed to get a reply from Claude")
         say(
