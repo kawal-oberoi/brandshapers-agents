@@ -15,6 +15,7 @@ read from environment variables (loaded from a local .env file in development).
 
 import logging
 import os
+import re
 
 import anthropic
 from dotenv import load_dotenv
@@ -35,7 +36,7 @@ log = logging.getLogger("agent-1")
 
 # The model we want to use, plus the fallback if that exact string ever stops
 # being available. claude-opus-4-8 is the latest, most capable Claude model.
-PREFERRED_MODEL = "claude-sonnet-4-6"
+PREFERRED_MODEL = "claude-opus-4-8"
 FALLBACK_MODEL = "claude-opus-4-8"
 
 # Once we discover which model actually works, we remember it so we don't keep
@@ -78,6 +79,21 @@ if _missing:
 
 app = App(token=SLACK_BOT_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# Slack identifies the bot by a user ID like "U0123ABCD". We ask Slack for it
+# once at startup so we can (a) strip the bot's own @mention out of message
+# text and (b) tell when a plain message is actually an @mention.
+BOT_USER_ID = app.client.auth_test()["user_id"]
+
+
+def strip_bot_mention(text: str) -> str:
+    """Remove the bot's @mention (e.g. "<@U0123ABCD>") from a message."""
+    return re.sub(rf"<@{BOT_USER_ID}(\|[^>]+)?>", "", text).strip()
+
+
+def mentions_bot(text: str) -> bool:
+    """True if the text contains an @mention of this bot."""
+    return bool(re.search(rf"<@{BOT_USER_ID}(\|[^>]+)?>", text))
 
 
 # ---------------------------------------------------------------------------
@@ -125,21 +141,9 @@ def ask_claude(user_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@app.event("message")
-def handle_message(event, say, logger):
-    """
-    Runs every time a message is posted in a channel the bot is in.
-
-    We ignore:
-      * messages from any bot (event has a "bot_id"), which also covers our own
-        messages, so the bot never replies to itself;
-      * message edits, deletions, joins, and other non-standard message types
-        (these have a "subtype").
-    """
-    if event.get("bot_id") or event.get("subtype"):
-        return
-
-    user_text = event.get("text", "").strip()
+def _reply_with_claude(user_text, event, say, logger):
+    """Shared logic: send text to Claude and post the reply in a thread."""
+    user_text = user_text.strip()
     if not user_text:
         return
 
@@ -158,6 +162,42 @@ def handle_message(event, say, logger):
         return
 
     say(text=reply or "(no reply)", thread_ts=thread_ts)
+
+
+@app.event("app_mention")
+def handle_app_mention(event, say, logger):
+    """
+    Runs when someone @mentions the bot in a channel. We remove the bot's own
+    @mention from the text and send the rest to Claude.
+    """
+    if event.get("bot_id"):
+        return
+    user_text = strip_bot_mention(event.get("text", ""))
+    _reply_with_claude(user_text, event, say, logger)
+
+
+@app.event("message")
+def handle_message(event, say, logger):
+    """
+    Runs every time a message is posted in a channel the bot is in. This lets
+    you talk to the bot WITHOUT @mentioning it.
+
+    We ignore:
+      * messages from any bot (event has a "bot_id"), which also covers our own
+        messages, so the bot never replies to itself;
+      * message edits, deletions, joins, and other non-standard message types
+        (these have a "subtype");
+      * messages that @mention the bot — those are handled by the app_mention
+        handler above, so skipping them here avoids replying twice.
+    """
+    if event.get("bot_id") or event.get("subtype"):
+        return
+
+    user_text = event.get("text", "")
+    if mentions_bot(user_text):
+        return
+
+    _reply_with_claude(user_text, event, say, logger)
 
 
 # ---------------------------------------------------------------------------

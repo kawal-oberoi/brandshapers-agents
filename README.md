@@ -52,6 +52,18 @@ These are read from environment variables, loaded from `.env` in development:
 
 ## Model
 
-The bot uses `claude-sonnet-4-6`. If that exact model string is ever rejected,
-it automatically falls back to the latest model (`claude-opus-4-8`) and notes
-the switch in its console logs.
+The bot uses `claude-opus-4-8`, the latest and most capable Claude model.
+
+## Deploying 24/7 (Railway)
+
+This repo is ready to run on [Railway](https://railway.app) as a background
+**worker** — no web server or open port is needed, because Slack Socket Mode
+connects outward.
+
+- `Procfile` defines a single `worker` process that runs `python app.py`.
+- `.python-version` pins the Python version Railway should use.
+- The three secrets are set in **Railway → your project → Variables**, never
+  committed to git: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ANTHROPIC_API_KEY`.
+
+After connecting this GitHub repo to Railway, Railway installs
+`requirements.txt` and starts the worker automatically.
