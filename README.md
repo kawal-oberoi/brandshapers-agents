@@ -50,6 +50,40 @@ These are read from environment variables, loaded from `.env` in development:
 | `SLACK_APP_TOKEN`   | Slack app → Basic Information → App-Level Tokens (`xapp-…`, scope `connections:write`) |
 | `ANTHROPIC_API_KEY` | console.anthropic.com → API Keys (`sk-ant-…`)         |
 
+## Agent 2 — the Sourcer
+
+Agent 2 finds new outreach leads from Apollo.io and writes them into a **Leads**
+tab in the same Google Sheet. It is built to protect Apollo credits above all:
+
+- **Search is free.** It pulls candidates and scores them A/B/C using only free
+  Apollo search data (title, company, location, a masked name, and a
+  "has email?" flag).
+- **Enrichment costs ~1 credit each**, so it enriches **only** the best Tier-A
+  then Tier-B keepers, never weak (C) matches or competitor agencies.
+- **Monthly cap** (`APOLLO_MONTHLY_CAP`, default 70) is a hard ceiling — it
+  trims or stops a run before it can ever overspend, and resets each month.
+- **Dry runs cost nothing.** `dry_run=true` does everything except enrichment.
+
+**Use it from Slack** by talking to the bot in plain English, e.g.
+*"source 10 bfsi-lending advertiser leads"* or *"find publisher leads"*. The
+detailed summary (searched / qualified / enriched / written / credits used) is
+posted to **#outreach-control**.
+
+**Try a free preview from the terminal** (no credits, no Slack needed):
+
+```bash
+python3 sourcer.py bfsi-lending      # preview the default 10
+python3 sourcer.py publisher 5       # preview 5 publisher leads
+```
+
+Segments live in `sourcer.py` under `SEARCH_PRESETS` and are easy to edit:
+`bfsi-insurance`, `bfsi-lending`, `bfsi-neobank`, `bfsi-stocktrading`,
+`mobile-gaming`, `ott`, `dating` (advertiser) and `publisher`.
+
+A built-in **weekly scheduler** auto-sources the next active advertiser segment
+in rotation (default Monday 09:00 India time). Turn it off or change the timing
+with the `SOURCER_SCHEDULE_*` environment variables (see `.env.example`).
+
 ## Model
 
 The bot uses `claude-opus-4-8`, the latest and most capable Claude model.

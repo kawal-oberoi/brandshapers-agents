@@ -21,14 +21,16 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import anthropic
-import gspread
+from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
-from google.oauth2.service_account import Credentials
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+import sheets    # shared Google Sheet connection (used by both agents)
+import sourcer   # Agent 2 — the Sourcer
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -67,7 +69,12 @@ SYSTEM_PROMPT = (
     "  - update_segment: add or update a target vertical/segment in the "
     "Segments tab (e.g. pause or activate 'mobile gaming').\n"
     "  - add_or_update_brief: add or update a campaign brief in the Briefs tab "
-    "(e.g. add a new brief or mark one discontinued).\n\n"
+    "(e.g. add a new brief or mark one discontinued).\n"
+    "  - source_leads: find new outreach leads for a segment (this is Agent 2, "
+    "the Sourcer). Use it whenever the user asks to source, find, pull, or get "
+    "leads/prospects — e.g. 'source 10 bfsi-lending advertiser leads' or 'find "
+    "publisher leads'. Map their words to one segment key and pass max_enrich if "
+    "they give a number. Only set dry_run=true if they ask for a test/preview.\n\n"
     "RULES YOU MUST FOLLOW:\n"
     "1. For ANY question about the current state — what is active, paused, "
     "discontinued, or recorded, or 'do we have X' — you MUST call read_state "
@@ -139,12 +146,9 @@ def mentions_bot(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheet — the source of truth
+# Google Sheet — the source of truth (the connection lives in sheets.py and is
+# shared with Agent 2, so both agents read/write the same one Sheet).
 # ---------------------------------------------------------------------------
-
-# We only need access to spreadsheets. The Sheet must be shared (as Editor)
-# with the service account's email address.
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Tab names and their header rows.
 SEGMENTS_TAB = "Segments"
@@ -152,80 +156,15 @@ SEGMENTS_HEADERS = ["Segment", "Pipeline", "Status", "Updated", "Notes"]
 BRIEFS_TAB = "Briefs"
 BRIEFS_HEADERS = ["Company", "Vertical", "Pipeline", "Status", "Details", "Updated"]
 
-
-def _load_google_credentials() -> Credentials:
-    """
-    Build Google credentials from either:
-      * the GOOGLE_CREDENTIALS_JSON environment variable (used on Railway), or
-      * the local google-credentials.json file (used on your own machine).
-    The environment variable is preferred when it is set.
-    """
-    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if raw:
-        info = json.loads(raw)
-        return Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
-    if os.path.exists("google-credentials.json"):
-        return Credentials.from_service_account_file(
-            "google-credentials.json", scopes=GOOGLE_SCOPES
-        )
+_spreadsheet = sheets.open_spreadsheet()
+if _spreadsheet is None:
     raise SystemExit(
-        "No Google credentials found. Either set GOOGLE_CREDENTIALS_JSON or put "
-        "google-credentials.json in the project folder."
+        "No Google credentials / Sheet ID found. Either set GOOGLE_CREDENTIALS_JSON "
+        "or put google-credentials.json in the project folder, and set GOOGLE_SHEET_ID."
     )
-
-
-def _ensure_tab(spreadsheet, title: str, headers: list) -> "gspread.Worksheet":
-    """Return the named tab, creating it with a header row if it doesn't exist."""
-    try:
-        worksheet = spreadsheet.worksheet(title)
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=title, rows=200, cols=len(headers))
-        worksheet.append_row(headers)
-        log.info("Created missing tab %r with headers.", title)
-        return worksheet
-    # Tab exists but is empty — add the header row.
-    if not worksheet.row_values(1):
-        worksheet.append_row(headers)
-        log.info("Added header row to existing empty tab %r.", title)
-    return worksheet
-
-
-log.info("Connecting to Google Sheet %s…", GOOGLE_SHEET_ID)
-_gc = gspread.authorize(_load_google_credentials())
-_spreadsheet = _gc.open_by_key(GOOGLE_SHEET_ID)
-segments_ws = _ensure_tab(_spreadsheet, SEGMENTS_TAB, SEGMENTS_HEADERS)
-briefs_ws = _ensure_tab(_spreadsheet, BRIEFS_TAB, BRIEFS_HEADERS)
+segments_ws = sheets.ensure_tab(_spreadsheet, SEGMENTS_TAB, SEGMENTS_HEADERS)
+briefs_ws = sheets.ensure_tab(_spreadsheet, BRIEFS_TAB, BRIEFS_HEADERS)
 log.info("Google Sheet ready (tabs: %s, %s).", SEGMENTS_TAB, BRIEFS_TAB)
-
-
-def _now() -> str:
-    """A readable UTC timestamp for the 'Updated' column."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-
-def _upsert_row(worksheet, key_columns: list, new_row: list, key_values: list) -> bool:
-    """
-    Add or update a row. If a row already exists whose values in `key_columns`
-    (0-based indexes) match `key_values` (case-insensitively), overwrite it;
-    otherwise append a new row. Returns True if an existing row was updated.
-    """
-    existing_rows = worksheet.get_all_values()  # includes the header row
-    wanted = [str(v).strip().lower() for v in key_values]
-    # Start at index 1 to skip the header row.
-    for i in range(1, len(existing_rows)):
-        row = existing_rows[i]
-        actual = [
-            (row[c].strip().lower() if c < len(row) else "") for c in key_columns
-        ]
-        if actual == wanted:
-            sheet_row = i + 1  # spreadsheet rows are 1-based
-            last_col = chr(ord("A") + len(new_row) - 1)
-            worksheet.update(
-                range_name=f"A{sheet_row}:{last_col}{sheet_row}", values=[new_row]
-            )
-            return True
-    worksheet.append_row(new_row)
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +174,8 @@ def _upsert_row(worksheet, key_columns: list, new_row: list, key_values: list) -
 
 def update_segment(segment: str, pipeline: str, status: str, notes: str = "") -> str:
     """Add or update a segment row. Keyed by (Segment, Pipeline)."""
-    new_row = [segment, pipeline, status, _now(), notes]
-    updated = _upsert_row(
+    new_row = [segment, pipeline, status, sheets.now_utc(), notes]
+    updated = sheets.upsert_row(
         segments_ws, key_columns=[0, 1], new_row=new_row, key_values=[segment, pipeline]
     )
     verb = "Updated" if updated else "Added"
@@ -247,8 +186,8 @@ def add_or_update_brief(
     company: str, vertical: str, pipeline: str, status: str, details: str = ""
 ) -> str:
     """Add or update a brief row. Keyed by (Company, Pipeline)."""
-    new_row = [company, vertical, pipeline, status, details, _now()]
-    updated = _upsert_row(
+    new_row = [company, vertical, pipeline, status, details, sheets.now_utc()]
+    updated = sheets.upsert_row(
         briefs_ws, key_columns=[0, 2], new_row=new_row, key_values=[company, pipeline]
     )
     verb = "Updated" if updated else "Added"
@@ -262,6 +201,40 @@ def read_state() -> str:
         "briefs": briefs_ws.get_all_values(),
     }
     return json.dumps(state)
+
+
+# Where Agent 2 posts its sourcing summaries. Configurable via env.
+OUTREACH_CHANNEL = os.environ.get("OUTREACH_CHANNEL", sourcer.OUTREACH_CHANNEL)
+
+
+def post_to_outreach(text: str) -> None:
+    """Post a message to the #outreach-control channel (used by the Sourcer)."""
+    try:
+        app.client.chat_postMessage(channel=OUTREACH_CHANNEL, text=text)
+    except Exception:
+        log.exception("Could not post to %s", OUTREACH_CHANNEL)
+
+
+def source_leads_tool(segment: str, max_enrich: int = 10, dry_run: bool = False) -> str:
+    """
+    Run Agent 2's sourcing for a segment. The full plain-English summary is
+    posted to #outreach-control; this returns a short confirmation for the
+    Slack thread the user typed in.
+    """
+    summary = sourcer.source_leads(
+        segment, max_enrich=int(max_enrich), dry_run=bool(dry_run), notify=post_to_outreach
+    )
+    if not summary.get("ok"):
+        return summary.get("message", "Sourcing could not run — see #outreach-control.")
+    if summary.get("skipped"):
+        return f"Skipped {summary.get('segment')} ({summary.get('reason')}). Posted a note to {OUTREACH_CHANNEL}."
+    seg = summary.get("segment")
+    if summary.get("dry_run"):
+        return (f"Dry run for {seg} done (0 credits) — would enrich "
+                f"{summary.get('would_enrich', 0)}. Details in {OUTREACH_CHANNEL}.")
+    return (f"Sourced {seg}: enriched {summary.get('enriched', 0)}, wrote "
+            f"{summary.get('written', 0)}, used {summary.get('credits_used', 0)} credits. "
+            f"Full summary in {OUTREACH_CHANNEL}.")
 
 
 # Tool definitions sent to Claude. The descriptions tell Claude when to use each.
@@ -339,6 +312,44 @@ TOOLS = [
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "source_leads",
+        "description": (
+            "Find (source) new outreach leads for a segment using Agent 2, the "
+            "Sourcer. Use this when the user asks to 'source', 'find', 'pull', or "
+            "'get' leads/prospects — e.g. 'source 10 bfsi-lending advertiser "
+            "leads' or 'find publisher leads'. It runs a free Apollo search, "
+            "scores candidates, and enriches only the best ones (each enrichment "
+            "costs ~1 Apollo credit). Map the user's words to ONE segment key. "
+            "Advertiser segments: bfsi-insurance, bfsi-lending, bfsi-neobank, "
+            "bfsi-stocktrading, mobile-gaming, ott, dating. Publisher segment: "
+            "publisher. If the user only says 'publisher leads', use segment "
+            "'publisher'. Set dry_run=true ONLY if the user asks for a test / "
+            "preview / dry run (then it spends 0 credits). Default max_enrich is "
+            "10. The detailed summary is posted to the outreach channel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "segment": {
+                    "type": "string",
+                    "description": (
+                        "The segment key, e.g. 'bfsi-lending', 'mobile-gaming', "
+                        "or 'publisher'."
+                    ),
+                },
+                "max_enrich": {
+                    "type": "integer",
+                    "description": "Max people to enrich this run (each ~1 credit). Default 10.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, preview only — spend 0 credits (no enrichment).",
+                },
+            },
+            "required": ["segment"],
+        },
+    },
 ]
 
 
@@ -361,6 +372,12 @@ def _run_tool(name: str, tool_input: dict) -> str:
         )
     if name == "read_state":
         return read_state()
+    if name == "source_leads":
+        return source_leads_tool(
+            tool_input["segment"],
+            tool_input.get("max_enrich", 10),
+            tool_input.get("dry_run", False),
+        )
     return f"Unknown tool: {name}"
 
 
@@ -581,9 +598,50 @@ def handle_message(event, say, logger):
 
 
 # ---------------------------------------------------------------------------
+# Weekly scheduler (Agent 2) — auto-source the next active advertiser segment.
+# All settings are env vars so you can change day/time or switch it off without
+# touching code. Defaults: ON, every Monday 09:00 India time.
+# ---------------------------------------------------------------------------
+SCHEDULE_ENABLED = os.environ.get("SOURCER_SCHEDULE_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+SCHEDULE_DAY = os.environ.get("SOURCER_SCHEDULE_DAY", "mon")          # mon..sun
+SCHEDULE_HOUR = int(os.environ.get("SOURCER_SCHEDULE_HOUR", "9"))     # 0..23
+SCHEDULE_MINUTE = int(os.environ.get("SOURCER_SCHEDULE_MINUTE", "0"))
+SCHEDULE_TZ = os.environ.get("SOURCER_SCHEDULE_TZ", "Asia/Kolkata")
+SCHEDULE_MAX_ENRICH = int(os.environ.get("SOURCER_SCHEDULE_MAX_ENRICH", "10"))
+
+
+def start_scheduler():
+    """Start the weekly auto-sourcing job, unless it's switched off."""
+    if not SCHEDULE_ENABLED:
+        log.info("Weekly sourcing scheduler is OFF (SOURCER_SCHEDULE_ENABLED).")
+        return
+    scheduler = BackgroundScheduler(timezone=ZoneInfo(SCHEDULE_TZ))
+    scheduler.add_job(
+        lambda: sourcer.run_scheduled(
+            notify=post_to_outreach, max_enrich=SCHEDULE_MAX_ENRICH
+        ),
+        trigger="cron",
+        day_of_week=SCHEDULE_DAY,
+        hour=SCHEDULE_HOUR,
+        minute=SCHEDULE_MINUTE,
+        id="weekly_sourcing",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    log.info(
+        "Weekly sourcing scheduled: %s %02d:%02d %s (max_enrich=%d).",
+        SCHEDULE_DAY, SCHEDULE_HOUR, SCHEDULE_MINUTE, SCHEDULE_TZ, SCHEDULE_MAX_ENRICH,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Start the bot
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    log.info("Starting Agent 1 (preferred model: %s)…", PREFERRED_MODEL)
+    log.info("Starting Agent 1 + Agent 2 (preferred model: %s)…", PREFERRED_MODEL)
+    start_scheduler()
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
