@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+import cockpit   # Agent 4 — the Send Cockpit
 import personalizer  # Agent 3 — the Personalizer
 import sheets    # shared Google Sheet connection (used by every agent)
 import sourcer   # Agent 2 — the Sourcer
@@ -81,7 +82,14 @@ SYSTEM_PROMPT = (
     "the user says 'draft messages', 'personalize new leads', 'write outreach', "
     "or similar. It spends only Anthropic tokens (no Apollo credits) and sets "
     "each first DM to 'pending' human approval. After it runs, report how many "
-    "were drafted; the detailed preview is posted to the outreach channel.\n\n"
+    "were drafted; the detailed preview is posted to the outreach channel.\n"
+    "  - queue_sends: show today's approved leads as send-cards for manual "
+    "sending (this is Agent 4, the Send Cockpit). Use it when the user says "
+    "'queue sends', 'show me today's outreach', 'queue 3 sends', or similar. It "
+    "queues ONLY leads the user has approved (DMApproval='approve'), up to a "
+    "daily cap, and posts a card per lead (with the first DM and buttons) to the "
+    "send channel. Pass `limit` only if the user gives a number. It never sends "
+    "anything itself — the human sends manually on LinkedIn.\n\n"
     "RULES YOU MUST FOLLOW:\n"
     "1. For ANY question about the current state — what is active, paused, "
     "discontinued, or recorded, or 'do we have X' — you MUST call read_state "
@@ -262,6 +270,47 @@ def draft_messages_tool(limit: int = 10) -> str:
             f"Leads tab (DMApproval column). Preview in {OUTREACH_CHANNEL}.")
 
 
+# Where Agent 4 posts its send-cards. Configurable via env.
+SEND_CHANNEL = os.environ.get("SEND_CHANNEL", cockpit.SEND_CHANNEL)
+
+
+def post_card(card: dict) -> None:
+    """Post one Agent 4 send-card (Block Kit) to the send channel."""
+    try:
+        app.client.chat_postMessage(
+            channel=SEND_CHANNEL, blocks=card["blocks"], text=card["text"]
+        )
+    except Exception:
+        log.exception("Could not post a send-card to %s", SEND_CHANNEL)
+
+
+def post_to_send(text: str) -> None:
+    """Post a short summary line to the send channel."""
+    try:
+        app.client.chat_postMessage(channel=SEND_CHANNEL, text=text)
+    except Exception:
+        log.exception("Could not post to %s", SEND_CHANNEL)
+
+
+def queue_sends_tool(limit=None) -> str:
+    """
+    Run Agent 4's daily queue. Cards are posted to the send channel; this returns
+    a short confirmation for the Slack thread the user typed in. `limit` (when the
+    user says 'queue N sends') overrides the daily cap for this one run.
+    """
+    summary = cockpit.queue_sends(
+        limit=limit, dry_run=False, post_card=post_card, notify=post_to_send
+    )
+    if not summary.get("ok"):
+        return summary.get("message", "Couldn't queue sends — see the send channel.")
+    count = summary.get("count", 0)
+    if not count:
+        return ("No approved leads are waiting. Approve some first by setting "
+                "DMApproval='approve' on the Leads tab.")
+    return (f"Queued {count} lead(s) to {SEND_CHANNEL}. Open each card and use "
+            f"the buttons as you action them on LinkedIn.")
+
+
 # Tool definitions sent to Claude. The descriptions tell Claude when to use each.
 TOOLS = [
     {
@@ -397,6 +446,33 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "queue_sends",
+        "description": (
+            "Queue today's approved leads as send-cards for MANUAL sending, using "
+            "Agent 4, the Send Cockpit. Use this when the user says 'queue sends', "
+            "'show me today's outreach', 'queue 3 sends', or similar. It queues "
+            "ONLY leads with DMApproval='approve' that haven't been queued yet, up "
+            "to a daily cap (env SEND_DAILY_CAP, default 5), marks each "
+            "SendStatus='queued', and posts one card per lead — with the person's "
+            "details, LinkedIn link, the exact first DM, and buttons — to the send "
+            "channel. It NEVER sends anything on LinkedIn itself; the human sends "
+            "manually. Pass `limit` ONLY if the user gives a number (e.g. 'queue 3 "
+            "sends')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Override the daily cap for this one run (e.g. 3 for "
+                        "'queue 3 sends'). Omit to use the daily cap."
+                    ),
+                },
+            },
+        },
+    },
 ]
 
 
@@ -427,6 +503,8 @@ def _run_tool(name: str, tool_input: dict) -> str:
         )
     if name == "draft_messages":
         return draft_messages_tool(tool_input.get("limit", 10))
+    if name == "queue_sends":
+        return queue_sends_tool(tool_input.get("limit"))
     return f"Unknown tool: {name}"
 
 
@@ -647,6 +725,36 @@ def handle_message(event, say, logger):
 
 
 # ---------------------------------------------------------------------------
+# Agent 4 — send-card button clicks
+#
+# When you click a button on a send-card, Slack (over Socket Mode) sends us an
+# action. We record the new SendStatus on that lead's row and confirm in the
+# card's thread. NOTE: this only RECORDS where a lead is in the funnel — the bot
+# never sends anything on LinkedIn. All sending is done by you, by hand.
+# ---------------------------------------------------------------------------
+@app.action(re.compile(r"^send_(mark_requested|mark_accepted|mark_messaged|skip)$"))
+def handle_send_button(ack, body, logger):
+    ack()  # acknowledge the click immediately, as Slack requires
+    try:
+        action = body["actions"][0]
+        status = cockpit.BUTTON_STATUS.get(action["action_id"])
+        identifier = action.get("value", "")
+        channel = body["channel"]["id"]
+        thread_ts = body["message"]["ts"]
+        if not status:
+            return
+        result = cockpit.mark_status(identifier, status)
+        if result.get("ok"):
+            text = (f"✅ *{result['name']}* → *{status}* "
+                    f"(recorded {result.get('date', '')}).")
+        else:
+            text = f"⚠️ {result.get('message', 'Could not update that lead.')}"
+        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    except Exception:
+        logger.exception("Send-card button failed")
+
+
+# ---------------------------------------------------------------------------
 # Weekly scheduler (Agent 2) — auto-source the next active advertiser segment.
 # All settings are env vars so you can change day/time or switch it off without
 # touching code. Defaults: ON, every Monday 09:00 India time.
@@ -687,10 +795,50 @@ def start_scheduler():
 
 
 # ---------------------------------------------------------------------------
+# Daily scheduler (Agent 4) — post the day's approved leads as send-cards.
+# All settings are env vars so you can change time or switch it off without
+# touching code. Defaults: ON, every day 10:00 India time.
+# ---------------------------------------------------------------------------
+SEND_SCHEDULE_ENABLED = os.environ.get("SEND_SCHEDULE_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+SEND_SCHEDULE_HOUR = int(os.environ.get("SEND_SCHEDULE_HOUR", "10"))   # 0..23
+SEND_SCHEDULE_MINUTE = int(os.environ.get("SEND_SCHEDULE_MINUTE", "0"))
+SEND_SCHEDULE_TZ = os.environ.get("SEND_SCHEDULE_TZ", "Asia/Kolkata")
+
+
+def start_send_scheduler():
+    """Start the daily send-cockpit job, unless it's switched off."""
+    if not SEND_SCHEDULE_ENABLED:
+        log.info("Daily send scheduler is OFF (SEND_SCHEDULE_ENABLED).")
+        return
+    scheduler = BackgroundScheduler(timezone=ZoneInfo(SEND_SCHEDULE_TZ))
+    scheduler.add_job(
+        lambda: cockpit.queue_sends(post_card=post_card, notify=post_to_send),
+        trigger="cron",
+        hour=SEND_SCHEDULE_HOUR,
+        minute=SEND_SCHEDULE_MINUTE,
+        id="daily_sends",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    log.info(
+        "Daily send queue scheduled: %02d:%02d %s (cap=%d → %s).",
+        SEND_SCHEDULE_HOUR, SEND_SCHEDULE_MINUTE, SEND_SCHEDULE_TZ,
+        cockpit.daily_cap(), SEND_CHANNEL,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Start the bot
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    log.info("Starting Agent 1 + Agent 2 + Agent 3 (preferred model: %s)…", PREFERRED_MODEL)
+    log.info(
+        "Starting Agent 1 + Agent 2 + Agent 3 + Agent 4 (preferred model: %s)…",
+        PREFERRED_MODEL,
+    )
     start_scheduler()
+    start_send_scheduler()
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
