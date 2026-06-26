@@ -29,7 +29,8 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-import sheets    # shared Google Sheet connection (used by both agents)
+import personalizer  # Agent 3 — the Personalizer
+import sheets    # shared Google Sheet connection (used by every agent)
 import sourcer   # Agent 2 — the Sourcer
 
 # ---------------------------------------------------------------------------
@@ -74,7 +75,13 @@ SYSTEM_PROMPT = (
     "the Sourcer). Use it whenever the user asks to source, find, pull, or get "
     "leads/prospects — e.g. 'source 10 bfsi-lending advertiser leads' or 'find "
     "publisher leads'. Map their words to one segment key and pass max_enrich if "
-    "they give a number. Only set dry_run=true if they ask for a test/preview.\n\n"
+    "they give a number. Only set dry_run=true if they ask for a test/preview.\n"
+    "  - draft_messages: write ready-to-send LinkedIn outreach for leads that "
+    "don't have messages yet (this is Agent 3, the Personalizer). Use it when "
+    "the user says 'draft messages', 'personalize new leads', 'write outreach', "
+    "or similar. It spends only Anthropic tokens (no Apollo credits) and sets "
+    "each first DM to 'pending' human approval. After it runs, report how many "
+    "were drafted; the detailed preview is posted to the outreach channel.\n\n"
     "RULES YOU MUST FOLLOW:\n"
     "1. For ANY question about the current state — what is active, paused, "
     "discontinued, or recorded, or 'do we have X' — you MUST call read_state "
@@ -237,6 +244,24 @@ def source_leads_tool(segment: str, max_enrich: int = 10, dry_run: bool = False)
             f"Full summary in {OUTREACH_CHANNEL}.")
 
 
+def draft_messages_tool(limit: int = 10) -> str:
+    """
+    Run Agent 3's personalizer. The preview (count + first 1-2 first DMs + the
+    approval reminder + sheet link) is posted to #outreach-control; this returns
+    a short confirmation for the Slack thread the user typed in.
+    """
+    summary = personalizer.generate_messages(
+        limit=int(limit), dry_run=False, notify=post_to_outreach
+    )
+    if not summary.get("ok"):
+        return summary.get("message", "Couldn't draft messages — see #outreach-control.")
+    count = summary.get("count", 0)
+    if not count:
+        return "No new leads to draft — every lead already has messages."
+    return (f"Drafted {count} first DM(s), now pending your approval in the "
+            f"Leads tab (DMApproval column). Preview in {OUTREACH_CHANNEL}.")
+
+
 # Tool definitions sent to Claude. The descriptions tell Claude when to use each.
 TOOLS = [
     {
@@ -350,6 +375,28 @@ TOOLS = [
             "required": ["segment"],
         },
     },
+    {
+        "name": "draft_messages",
+        "description": (
+            "Write ready-to-send LinkedIn outreach for leads in the Leads tab "
+            "that don't have messages yet, using Agent 3, the Personalizer. Use "
+            "this when the user says 'draft messages', 'personalize new leads', "
+            "'write outreach for the new leads', or similar. It spends only "
+            "Anthropic tokens (no Apollo credits): it writes a first DM and two "
+            "follow-ups onto each lead's row, sets MsgStatus='drafted', and sets "
+            "DMApproval='pending' so the human can approve/reject/edit each first "
+            "DM. The detailed preview is posted to the outreach channel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of new leads to draft in one run (default 10).",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -378,6 +425,8 @@ def _run_tool(name: str, tool_input: dict) -> str:
             tool_input.get("max_enrich", 10),
             tool_input.get("dry_run", False),
         )
+    if name == "draft_messages":
+        return draft_messages_tool(tool_input.get("limit", 10))
     return f"Unknown tool: {name}"
 
 
@@ -642,6 +691,6 @@ def start_scheduler():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    log.info("Starting Agent 1 + Agent 2 (preferred model: %s)…", PREFERRED_MODEL)
+    log.info("Starting Agent 1 + Agent 2 + Agent 3 (preferred model: %s)…", PREFERRED_MODEL)
     start_scheduler()
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
