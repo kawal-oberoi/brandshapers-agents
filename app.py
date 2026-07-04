@@ -30,6 +30,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 import cockpit   # Agent 4 — the Send Cockpit
+import intent_scout  # Agent 6 — the Intent Scout
 import personalizer  # Agent 3 — the Personalizer
 import sheets    # shared Google Sheet connection (used by every agent)
 import sourcer   # Agent 2 — the Sourcer
@@ -89,7 +90,17 @@ SYSTEM_PROMPT = (
     "queues ONLY leads the user has approved (DMApproval='approve'), up to a "
     "daily cap, and posts a card per lead (with the first DM and buttons) to the "
     "send channel. Pass `limit` only if the user gives a number. It never sends "
-    "anything itself — the human sends manually on LinkedIn.\n\n"
+    "anything itself — the human sends manually on LinkedIn.\n"
+    "  - run_intent_scout: scrape LinkedIn POSTS matching the user's intent "
+    "queries and live campaigns, draft a comment per genuine post, and feed the "
+    "authors into the Leads tab (this is Agent 6, the Intent Scout). Use it when "
+    "the user says 'run intent scout', 'scout posts', 'find intent', or similar. "
+    "It reads scraped public posts (via Apify) and writes to the sheet only — it "
+    "NEVER logs into LinkedIn, posts, or comments; the user posts comments by "
+    "hand. It spends a small, budget-capped Apify amount and no Apollo credits.\n"
+    "  - scout_status: report Agent 6's Apify budget used this month, active "
+    "query counts, and the last run's results. Use it when the user asks 'scout "
+    "status', 'intent scout status', or 'how much Apify budget is left'.\n\n"
     "RULES YOU MUST FOLLOW:\n"
     "1. For ANY question about the current state — what is active, paused, "
     "discontinued, or recorded, or 'do we have X' — you MUST call read_state "
@@ -311,6 +322,32 @@ def queue_sends_tool(limit=None) -> str:
             f"the buttons as you action them on LinkedIn.")
 
 
+def run_intent_scout_tool(max_posts=None) -> str:
+    """
+    Run Agent 6's Intent Scout. The perfect-match pings and the full run summary
+    are posted to #outreach-control; this returns a short confirmation for the
+    Slack thread the user typed in. `max_posts` overrides the per-run cap.
+    """
+    summary = intent_scout.run_scout(max_posts=max_posts, notify=post_to_outreach)
+    if not summary.get("ok"):
+        return summary.get("message", "Intent Scout couldn't run — see #outreach-control.")
+    if summary.get("skipped"):
+        return (f"Intent Scout skipped ({summary.get('reason')}). "
+                f"Details in {OUTREACH_CHANNEL}.")
+    return (f"Intent Scout done: {summary.get('new_posts', 0)} new posts, "
+            f"{summary.get('genuine', 0)} comments drafted, "
+            f"{summary.get('perfect', 0)} perfect match(es), "
+            f"{summary.get('fed_to_leads', 0)} authors added to Leads. "
+            f"Full summary in {OUTREACH_CHANNEL}.")
+
+
+def scout_status_tool() -> str:
+    """Report Agent 6's budget + last run. Posts the detail to #outreach-control."""
+    result = intent_scout.scout_status(notify=post_to_outreach)
+    return (f"Intent Scout: ${result.get('spent', 0):.2f}/${result.get('budget', 0):.2f} "
+            f"Apify budget used this month. Details in {OUTREACH_CHANNEL}.")
+
+
 # Tool definitions sent to Claude. The descriptions tell Claude when to use each.
 TOOLS = [
     {
@@ -473,6 +510,44 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "run_intent_scout",
+        "description": (
+            "Run Agent 6, the Intent Scout: scrape recent LinkedIn POSTS that "
+            "match the user's intent queries (IntentQueries tab) and live "
+            "campaign bundle-ids (MyCampaigns tab), draft a public comment for "
+            "each genuine post, flag perfect matches, and feed the authors into "
+            "the Leads tab (Tier A, pending approval, 0 Apollo credits). Use when "
+            "the user says 'run intent scout', 'scout posts/intent', or similar. "
+            "It reads scraped public data and writes to the sheet ONLY — it never "
+            "logs into LinkedIn, posts, or comments. Apify spend is capped by a "
+            "monthly budget guard, and the run is skipped if it would exceed it. "
+            "Pass `max_posts` ONLY if the user gives a number (e.g. 'run intent "
+            "scout for 20 posts')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "max_posts": {
+                    "type": "integer",
+                    "description": (
+                        "Override the per-run post cap for this one run. Omit to "
+                        "use the default (SCOUT_MAX_POSTS, default 125)."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "scout_status",
+        "description": (
+            "Report Agent 6's status: how much of the monthly Apify budget has "
+            "been used, how many active queries/campaigns are configured, and the "
+            "last run's results. Use when the user says 'scout status', 'intent "
+            "scout status', or asks how much Apify budget is left."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -505,6 +580,10 @@ def _run_tool(name: str, tool_input: dict) -> str:
         return draft_messages_tool(tool_input.get("limit", 10))
     if name == "queue_sends":
         return queue_sends_tool(tool_input.get("limit"))
+    if name == "run_intent_scout":
+        return run_intent_scout_tool(tool_input.get("max_posts"))
+    if name == "scout_status":
+        return scout_status_tool()
     return f"Unknown tool: {name}"
 
 
@@ -831,14 +910,53 @@ def start_send_scheduler():
 
 
 # ---------------------------------------------------------------------------
+# Weekly scheduler (Agent 6) — scrape LinkedIn intent posts and draft comments.
+# All settings are env vars so you can change day/time or switch it off without
+# touching code. Defaults: ON, every Tuesday 09:00 India time.
+# ---------------------------------------------------------------------------
+SCOUT_SCHEDULE_ENABLED = os.environ.get("SCOUT_SCHEDULE_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+SCOUT_SCHEDULE_DAY = os.environ.get("SCOUT_SCHEDULE_DAY", "tue")          # mon..sun
+SCOUT_SCHEDULE_HOUR = int(os.environ.get("SCOUT_SCHEDULE_HOUR", "9"))     # 0..23
+SCOUT_SCHEDULE_MINUTE = int(os.environ.get("SCOUT_SCHEDULE_MINUTE", "0"))
+SCOUT_SCHEDULE_TZ = os.environ.get("SCOUT_SCHEDULE_TZ", "Asia/Kolkata")
+
+
+def start_scout_scheduler():
+    """Start the weekly intent-scout job, unless it's switched off."""
+    if not SCOUT_SCHEDULE_ENABLED:
+        log.info("Weekly intent-scout scheduler is OFF (SCOUT_SCHEDULE_ENABLED).")
+        return
+    scheduler = BackgroundScheduler(timezone=ZoneInfo(SCOUT_SCHEDULE_TZ))
+    scheduler.add_job(
+        lambda: intent_scout.run_scout(notify=post_to_outreach),
+        trigger="cron",
+        day_of_week=SCOUT_SCHEDULE_DAY,
+        hour=SCOUT_SCHEDULE_HOUR,
+        minute=SCOUT_SCHEDULE_MINUTE,
+        id="weekly_intent_scout",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    log.info(
+        "Weekly intent scout scheduled: %s %02d:%02d %s.",
+        SCOUT_SCHEDULE_DAY, SCOUT_SCHEDULE_HOUR, SCOUT_SCHEDULE_MINUTE, SCOUT_SCHEDULE_TZ,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Start the bot
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     log.info(
-        "Starting Agent 1 + Agent 2 + Agent 3 + Agent 4 (preferred model: %s)…",
+        "Starting Agent 1 + Agent 2 + Agent 3 + Agent 4 + Agent 6 "
+        "(preferred model: %s)…",
         PREFERRED_MODEL,
     )
     start_scheduler()
     start_send_scheduler()
+    start_scout_scheduler()
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
