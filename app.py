@@ -91,15 +91,23 @@ SYSTEM_PROMPT = (
     "daily cap, and posts a card per lead (with the first DM and buttons) to the "
     "send channel. Pass `limit` only if the user gives a number. It never sends "
     "anything itself — the human sends manually on LinkedIn.\n"
-    "  - run_intent_scout: scrape LinkedIn POSTS matching the user's intent "
-    "queries and live campaigns, draft a comment per genuine post, and feed the "
-    "authors into the Leads tab (this is Agent 6, the Intent Scout). Use it when "
-    "the user says 'run intent scout', 'scout posts', 'find intent', or similar. "
-    "It reads scraped public posts (via Apify) and writes to the sheet only — it "
-    "NEVER logs into LinkedIn, posts, or comments; the user posts comments by "
-    "hand. It spends a small, budget-capped Apify amount and no Apollo credits.\n"
-    "  - scout_status: report Agent 6's Apify budget used this month, active "
-    "query counts, and the last run's results. Use it when the user asks 'scout "
+    "  - add_campaign: parse a raw campaign brief the user pastes and save it to "
+    "the CampaignBriefs tab so Agent 6 can hunt publishers for it. Use it "
+    "WHENEVER the user says 'add campaign', 'new campaign', or pastes an "
+    "offer/campaign brief (name, Play/App Store link, model, geos, payouts, MMP). "
+    "Pass the WHOLE brief text verbatim; Claude extracts the fields (including the "
+    "app bundle-id from any store link) and shows the user the parsed summary.\n"
+    "  - run_intent_scout: for each Active campaign, scrape LinkedIn POSTS "
+    "matching its bundle-id and name, draft a comment per genuine publisher post, "
+    "and feed the authors into the Leads tab (this is Agent 6, the Intent Scout). "
+    "Use it when the user says 'run intent scout' or 'scout' (hunts ALL active "
+    "campaigns), or 'scout campaign <name>' (pass that name as `campaign` to hunt "
+    "just one). It reads scraped public posts (via Apify) and writes to the "
+    "sheets only — it NEVER logs into LinkedIn, posts, or comments; the user "
+    "posts comments by hand. It spends a small, budget-capped Apify amount and no "
+    "Apollo credits.\n"
+    "  - scout_status: report Agent 6's Apify budget used this month, the active "
+    "campaigns, and the last run's results. Use it when the user asks 'scout "
     "status', 'intent scout status', or 'how much Apify budget is left'.\n\n"
     "RULES YOU MUST FOLLOW:\n"
     "1. For ANY question about the current state — what is active, paused, "
@@ -322,13 +330,28 @@ def queue_sends_tool(limit=None) -> str:
             f"the buttons as you action them on LinkedIn.")
 
 
-def run_intent_scout_tool(max_posts=None) -> str:
+def add_campaign_tool(brief: str) -> str:
     """
-    Run Agent 6's Intent Scout. The perfect-match pings and the full run summary
+    Run Agent 6's campaign-brief parser. Claude parses the pasted brief into
+    fields, saves it to CampaignBriefs (Active=yes), and the parsed summary is
+    posted to #outreach-control. Returns that same summary for the Slack thread.
+    """
+    summary = intent_scout.add_campaign(brief, notify=post_to_outreach)
+    if not summary.get("ok"):
+        return summary.get("message", "Couldn't add that campaign — see #outreach-control.")
+    return summary.get("message", "Campaign saved.")
+
+
+def run_intent_scout_tool(max_posts=None, campaign=None) -> str:
+    """
+    Run Agent 6's Intent Scout. With no `campaign` it hunts ALL active campaigns;
+    with one it hunts just that campaign. The perfect-match pings and full summary
     are posted to #outreach-control; this returns a short confirmation for the
     Slack thread the user typed in. `max_posts` overrides the per-run cap.
     """
-    summary = intent_scout.run_scout(max_posts=max_posts, notify=post_to_outreach)
+    summary = intent_scout.run_scout(
+        max_posts=max_posts, notify=post_to_outreach, campaign_name=campaign
+    )
     if not summary.get("ok"):
         return summary.get("message", "Intent Scout couldn't run — see #outreach-control.")
     if summary.get("skipped"):
@@ -511,19 +534,43 @@ TOOLS = [
         },
     },
     {
+        "name": "add_campaign",
+        "description": (
+            "Parse a raw campaign brief the user pasted and save it to the "
+            "CampaignBriefs tab (Active=yes) for Agent 6 to hunt publishers for. "
+            "Use this WHENEVER the user says 'add campaign', 'new campaign', or "
+            "pastes a campaign/offer brief (a name, a Play Store or App Store "
+            "link, model, geos, payouts, MMP, etc.). Pass the ENTIRE brief text "
+            "verbatim as `brief` — do NOT summarise or reformat it; Claude parses "
+            "it into fields (extracting the app bundle-id from any store link) "
+            "and the parsed summary is posted for the user to review."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brief": {
+                    "type": "string",
+                    "description": "The raw campaign brief text, exactly as the user pasted it.",
+                },
+            },
+            "required": ["brief"],
+        },
+    },
+    {
         "name": "run_intent_scout",
         "description": (
-            "Run Agent 6, the Intent Scout: scrape recent LinkedIn POSTS that "
-            "match the user's intent queries (IntentQueries tab) and live "
-            "campaign bundle-ids (MyCampaigns tab), draft a public comment for "
-            "each genuine post, flag perfect matches, and feed the authors into "
-            "the Leads tab (Tier A, pending approval, 0 Apollo credits). Use when "
-            "the user says 'run intent scout', 'scout posts/intent', or similar. "
-            "It reads scraped public data and writes to the sheet ONLY — it never "
-            "logs into LinkedIn, posts, or comments. Apify spend is capped by a "
-            "monthly budget guard, and the run is skipped if it would exceed it. "
-            "Pass `max_posts` ONLY if the user gives a number (e.g. 'run intent "
-            "scout for 20 posts')."
+            "Run Agent 6, the Intent Scout: for each Active campaign in the "
+            "CampaignBriefs tab, scrape recent LinkedIn POSTS matching its "
+            "bundle-id and name, draft a public comment for each genuine "
+            "publisher post, flag perfect matches, and feed the authors into the "
+            "Leads tab (Tier A, pending approval, 0 Apollo credits). Use when the "
+            "user says 'run intent scout' or 'scout' (hunts ALL active "
+            "campaigns), or 'scout campaign <name>' (hunts just that one — pass "
+            "its name as `campaign`). It reads scraped public data and writes to "
+            "the sheets ONLY — it never logs into LinkedIn, posts, or comments. "
+            "Apify spend is capped by a monthly budget guard, and the run is "
+            "skipped if it would exceed it. Pass `max_posts` ONLY if the user "
+            "gives a number (e.g. 'run intent scout for 20 posts')."
         ),
         "input_schema": {
             "type": "object",
@@ -533,6 +580,13 @@ TOOLS = [
                     "description": (
                         "Override the per-run post cap for this one run. Omit to "
                         "use the default (SCOUT_MAX_POSTS, default 125)."
+                    ),
+                },
+                "campaign": {
+                    "type": "string",
+                    "description": (
+                        "Hunt only this one campaign (its exact CampaignName). "
+                        "Omit to hunt ALL active campaigns."
                     ),
                 },
             },
@@ -580,8 +634,12 @@ def _run_tool(name: str, tool_input: dict) -> str:
         return draft_messages_tool(tool_input.get("limit", 10))
     if name == "queue_sends":
         return queue_sends_tool(tool_input.get("limit"))
+    if name == "add_campaign":
+        return add_campaign_tool(tool_input["brief"])
     if name == "run_intent_scout":
-        return run_intent_scout_tool(tool_input.get("max_posts"))
+        return run_intent_scout_tool(
+            tool_input.get("max_posts"), tool_input.get("campaign")
+        )
     if name == "scout_status":
         return scout_status_tool()
     return f"Unknown tool: {name}"

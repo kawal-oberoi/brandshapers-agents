@@ -74,6 +74,49 @@ def open_spreadsheet():
     return _cached_spreadsheet
 
 
+# A second cache, keyed by Sheet ID, for any EXTRA spreadsheets we open beyond
+# the main source-of-truth one (e.g. Agent 6's separate campaign sheet). Each id
+# is connected once and reused, exactly like open_spreadsheet() above.
+_cached_by_id = {}
+
+
+def open_spreadsheet_by_id(sheet_id):
+    """
+    Open (once) and return the spreadsheet with the given id, or None if the id
+    is blank/placeholder or credentials are missing. Cached per id. This lets an
+    agent use a SECOND Google Sheet without disturbing the main one.
+    """
+    sheet_id = (sheet_id or "").strip()
+    if not sheet_id or "your-" in sheet_id:
+        return None
+    if sheet_id in _cached_by_id:
+        return _cached_by_id[sheet_id]
+
+    creds = load_google_credentials()
+    if not creds:
+        log.warning("No Google credentials — can't open sheet %s.", sheet_id)
+        _cached_by_id[sheet_id] = None
+        return None
+    try:
+        gc = gspread.authorize(creds)
+        ss = gc.open_by_key(sheet_id)
+        log.info("Opened extra Google Sheet %s.", sheet_id)
+    except Exception:  # noqa: BLE001 — degrade gracefully like open_spreadsheet
+        log.exception("Could not open extra Google Sheet %s.", sheet_id)
+        ss = None
+    _cached_by_id[sheet_id] = ss
+    return ss
+
+
+def open_campaign_spreadsheet():
+    """
+    Open Agent 6's separate campaign sheet, identified by the CAMPAIGN_SHEET_ID
+    environment variable. Returns None if that variable isn't set (so callers can
+    say 'no campaign sheet connected' clearly instead of crashing).
+    """
+    return open_spreadsheet_by_id(os.environ.get("CAMPAIGN_SHEET_ID", ""))
+
+
 def ensure_tab(spreadsheet, title, headers):
     """Return the named tab, creating it with a header row if it doesn't exist."""
     try:
