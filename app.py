@@ -129,7 +129,16 @@ SYSTEM_PROMPT = (
     "the user volunteers one. Ask a SINGLE clarifying question only when "
     "essential information is genuinely missing — for example, the pipeline was "
     "not given and cannot be inferred. 'Pause mobile gaming, both pipelines' is "
-    "complete: call update_segment immediately, then confirm.\n\n"
+    "complete: call update_segment immediately, then confirm.\n"
+    "5. TOOL/ENVIRONMENT ERRORS ARE NEVER DURABLE FACTS. A message earlier in the "
+    "conversation saying a tool couldn't run — a missing API key or token (e.g. "
+    "'no APIFY_API_TOKEN'), 'not connected', a budget/credit guard skip, or any "
+    "other failure — describes only that ONE past moment. Config can change "
+    "between messages (a key added, a sheet connected, a budget reset). So when "
+    "the user asks for an action, you MUST call the relevant tool FRESH and report "
+    "what THIS call returns. NEVER refuse or answer 'the token/tool isn't "
+    "available' from a prior error without calling the tool again first. Only "
+    "report a tool as unavailable if the CURRENT call you just made says so.\n\n"
     "Pipelines are 'advertiser', 'publisher', or 'both'. When you restate "
     "intent, give a short structured summary (what changed, which pipeline, key "
     "details). Never let a missing detail stop you from calling read_state for "
@@ -756,6 +765,27 @@ def _slack_history(event) -> list:
     return messages
 
 
+# Phrases that only appear in the bot's OWN transient tool/environment failure
+# notices — a missing key/token, a not-connected sheet, or a guard skip. We drop
+# these from the history we feed back so a PAST failure can never be parroted as a
+# durable fact (the underlying config may have changed since). Deliberately does
+# NOT match successful run summaries (which say 'noise skipped: N', not 'skipped
+# (…)') or user messages (only bot messages are ever filtered).
+_TRANSIENT_TOOL_NOTICE_RE = re.compile(
+    r"APIFY_API_TOKEN|APOLLO_API_KEY|ANTHROPIC_API_KEY"
+    r"|couldn't run|could not run|can't run|couldn't finish"
+    r"|couldn't (?:draft|queue|add)|not connected|no campaign sheet"
+    r"|budget guard|credit cap|scrape failed|hit an error"
+    r"|skipped \(|no (?:google )?credentials",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_tool_notice(text: str) -> bool:
+    """True if a bot message is a transient tool/env failure notice (see above)."""
+    return bool(_TRANSIENT_TOOL_NOTICE_RE.search(text))
+
+
 def _build_conversation(event, user_text: str) -> list:
     """
     Turn the recent Slack messages into Claude-style prior turns, then append the
@@ -764,6 +794,8 @@ def _build_conversation(event, user_text: str) -> list:
       * The bot's own past messages become 'assistant' turns, so a follow-up like
         'effective immediately' connects to the bot's own clarifying question.
       * Everyone else's messages become 'user' turns.
+      * The bot's own transient tool/env FAILURE notices are skipped, so a past
+        'no APIFY_API_TOKEN' / guard-skip is never fed back as a durable fact.
       * The current message (matched by ts) is excluded from the history scan and
         re-added last, so it is always present and always last.
       * Consecutive same-role turns are merged, and any leading assistant turns
@@ -780,6 +812,8 @@ def _build_conversation(event, user_text: str) -> list:
         if not text:
             continue
         is_bot = bool(msg.get("bot_id")) or msg.get("user") == BOT_USER_ID
+        if is_bot and _is_transient_tool_notice(text):
+            continue  # never re-feed a past tool/env failure as if still true
         role = "assistant" if is_bot else "user"
         if turns and turns[-1]["role"] == role:
             turns[-1]["content"] += "\n" + text
