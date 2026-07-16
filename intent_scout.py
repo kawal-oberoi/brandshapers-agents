@@ -43,6 +43,7 @@ Run a local test from the terminal, e.g.:
     python3 intent_scout.py 15 "Rocket Reels"   # hunt ONE campaign, cap 15
 """
 
+import html
 import json
 import logging
 import math
@@ -379,7 +380,9 @@ def read_active_campaigns():
     for row in ws.get_all_values()[1:]:
         def cell(i):
             return (row[i].strip() if len(row) > i else "")
-        name = cell(0)
+        # Unescape so a name Slack encoded as e.g. 'MOOMOO-Invest &amp; Trade'
+        # matches, queries, and displays as 'MOOMOO-Invest & Trade'.
+        name = html.unescape(cell(0))
         active = cell(9)   # Active is column J now (after the two ID columns)
         if name and _is_yes(active):
             out.append({
@@ -482,9 +485,9 @@ def _find_campaign_row(ws, name):
     android_ids/ios_ids lists), or None if there's no such row yet. Used so a
     re-paste MERGES store IDs instead of overwriting them.
     """
-    want = name.strip().lower()
+    want = html.unescape(name).strip().lower()
     for row in ws.get_all_values()[1:]:
-        if row and row[0].strip().lower() == want:
+        if row and html.unescape(row[0]).strip().lower() == want:
             def cell(i):
                 return (row[i].strip() if len(row) > i else "")
             return {
@@ -509,6 +512,9 @@ def add_campaign(raw_brief, notify=None):
                 "message": ("No campaign sheet connected — set CAMPAIGN_SHEET_ID "
                             "(and share that sheet with the service account).")}
 
+    # Slack encodes & < > as &amp; &lt; &gt; — undo that before parsing/saving so
+    # the campaign name is stored and later matched as the human typed it.
+    raw_brief = html.unescape(raw_brief)
     fields = parse_campaign_brief(raw_brief)
     name = fields["CampaignName"]
     if not name:
@@ -1009,7 +1015,8 @@ def run_scout(max_posts=None, notify=None, campaign_name=None):
     # 1) Gather active campaigns (optionally narrowed to one).
     campaigns = read_active_campaigns()
     if campaign_name:
-        want = campaign_name.strip().lower()
+        # Undo Slack's &amp;/&lt;/&gt; so 'scout campaign MOOMOO-Invest & Trade' matches.
+        want = html.unescape(campaign_name).strip().lower()
         campaigns = [c for c in campaigns if c["name"].strip().lower() == want]
         if not campaigns:
             msg = (f"⚠️ No active campaign named '{campaign_name}' in CampaignBriefs. "
