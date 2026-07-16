@@ -1039,6 +1039,36 @@ def start_scout_scheduler():
 
 
 # ---------------------------------------------------------------------------
+# Boot-time environment check — logs which expected variables are present in
+# THIS process's environment (NAMES ONLY, never values). This makes a whole
+# class of problem visible at a glance: e.g. a container still running with a
+# stale env snapshot from before APIFY_API_TOKEN was set, which reads empty here
+# even though a fresh `printenv` shell shows it. "Present" means the same test
+# the tools use — set AND non-blank after strip.
+# ---------------------------------------------------------------------------
+_CHECKED_ENV_VARS = [
+    "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY",
+    "GOOGLE_SHEET_ID", "CAMPAIGN_SHEET_ID", "APOLLO_API_KEY", "APIFY_API_TOKEN",
+]
+
+
+def log_env_presence():
+    """Log present vs absent/blank env vars by NAME only (never their values)."""
+    present, absent = [], []
+    for name in _CHECKED_ENV_VARS:
+        (present if os.environ.get(name, "").strip() else absent).append(name)
+    # Google credentials may arrive as an env var OR a local file — treat either as present.
+    has_creds = bool(
+        os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+        or os.path.exists("google-credentials.json")
+    )
+    (present if has_creds else absent).append("GOOGLE_CREDENTIALS(env/file)")
+    log.info("Env check at boot — present: %s", ", ".join(present) or "(none)")
+    if absent:
+        log.warning("Env check at boot — ABSENT or blank: %s", ", ".join(absent))
+
+
+# ---------------------------------------------------------------------------
 # Start the bot
 # ---------------------------------------------------------------------------
 
@@ -1048,6 +1078,7 @@ if __name__ == "__main__":
         "(preferred model: %s)…",
         PREFERRED_MODEL,
     )
+    log_env_presence()
     start_scheduler()
     start_send_scheduler()
     start_scout_scheduler()

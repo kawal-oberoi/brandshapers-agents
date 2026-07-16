@@ -577,7 +577,10 @@ class ApifyError(Exception):
 def _apify_token():
     token = os.environ.get("APIFY_API_TOKEN", "").strip()
     if not token:
-        raise ApifyError(0, "No APIFY_API_TOKEN is set in the environment / .env file.")
+        raise ApifyError(0, "APIFY_API_TOKEN is not visible to this process. Check the "
+                            "'Env check at boot' log line — if it lists APIFY_API_TOKEN as "
+                            "absent, the running container has a stale env; redeploy/restart "
+                            "so it picks up the current variable.")
     return token
 
 
