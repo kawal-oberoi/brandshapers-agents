@@ -1213,14 +1213,35 @@ def run_scout(max_posts=None, notify=None, campaign_name=None):
     return summary
 
 
+def _health_checks():
+    """
+    Live health of Agent 6's two external dependencies, for `scout status`.
+    Reports STATUS only — never the token's value. Returns
+    (apify_token_present, campaign_sheet_state, apify_line, campaign_line).
+    """
+    apify_present = bool(os.environ.get("APIFY_API_TOKEN", "").strip())
+    apify_line = ("✅ visible to this process" if apify_present
+                  else "❌ NOT visible to this process (check the boot 'Env check' log / redeploy)")
+
+    if not os.environ.get("CAMPAIGN_SHEET_ID", "").strip():
+        sheet_state, campaign_line = "unset", "⚠️ CAMPAIGN_SHEET_ID is not set"
+    elif _campaign_ss() is not None:
+        sheet_state, campaign_line = "connected", "✅ connected"
+    else:
+        sheet_state = "unreachable"
+        campaign_line = "❌ set but not reachable (check sharing with the service account / credentials)"
+    return apify_present, sheet_state, apify_line, campaign_line
+
+
 def scout_status(notify=None):
-    """Report budget used, last run, last counts, and the active campaigns."""
+    """Report budget used, last run, last counts, active campaigns, and health."""
     month = _current_month()
     spent = spend_this_month(month)
     budget = monthly_budget()
     last_run = _meta_get("scout_last_run", "(never)")
     last_counts = _meta_get("scout_last_counts", "(no runs yet)")
     campaigns = read_active_campaigns()
+    apify_present, sheet_state, apify_line, campaign_line = _health_checks()
 
     if campaigns:
         camp_lines = "\n".join(
@@ -1235,6 +1256,8 @@ def scout_status(notify=None):
     pct = (spent / budget * 100) if budget else 0
     msg = (
         f"🛰️ *Intent Scout — status*\n"
+        f"• Apify token: {apify_line}\n"
+        f"• Campaign sheet: {campaign_line}\n"
         f"• Apify spend this month: *${spent:.2f} / ${budget:.2f}* ({pct:.0f}%)\n"
         f"• Active campaigns: *{len(campaigns)}*\n{camp_lines}\n"
         f"• Last run: *{last_run}*\n"
@@ -1245,7 +1268,8 @@ def scout_status(notify=None):
     else:
         log.info(msg)
     return {"ok": True, "spent": spent, "budget": budget, "message": msg,
-            "campaigns": len(campaigns), "last_run": last_run, "last_counts": last_counts}
+            "campaigns": len(campaigns), "last_run": last_run, "last_counts": last_counts,
+            "apify_token_present": apify_present, "campaign_sheet": sheet_state}
 
 
 # ---------------------------------------------------------------------------

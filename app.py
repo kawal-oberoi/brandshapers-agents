@@ -374,10 +374,13 @@ def run_intent_scout_tool(max_posts=None, campaign=None) -> str:
 
 
 def scout_status_tool() -> str:
-    """Report Agent 6's budget + last run. Posts the detail to #outreach-control."""
+    """Report Agent 6's budget + health. Posts the detail to #outreach-control."""
     result = intent_scout.scout_status(notify=post_to_outreach)
+    token = "present" if result.get("apify_token_present") else "MISSING"
+    sheet = result.get("campaign_sheet", "?")
     return (f"Intent Scout: ${result.get('spent', 0):.2f}/${result.get('budget', 0):.2f} "
-            f"Apify budget used this month. Details in {OUTREACH_CHANNEL}.")
+            f"Apify budget used this month. Apify token: {token}; campaign sheet: {sheet}. "
+            f"Details in {OUTREACH_CHANNEL}.")
 
 
 # Tool definitions sent to Claude. The descriptions tell Claude when to use each.
